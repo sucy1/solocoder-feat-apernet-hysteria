@@ -72,7 +72,7 @@ func (m *portManagerImpl) checkPortConflict(addr string) error {
 			continue
 		}
 		if port == existingPort && (host == existingHost || host == "" || existingHost == "" || host == "0.0.0.0" || existingHost == "0.0.0.0" || host == "::" || existingHost == "::") {
-			return fmt.Errorf("port conflict: %s and %s", addr, existingAddr)
+			return fmt.Errorf("port %s conflict: new addr %s conflicts with existing addr %s", port, addr, existingAddr)
 		}
 	}
 	return nil

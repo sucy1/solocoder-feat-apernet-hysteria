@@ -62,6 +62,9 @@ func (l *jsonConnLoggerImpl) writeEntry(entry ConnLogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry.Time = time.Now().Format(time.RFC3339Nano)
+	entry.Target = sanitizeString(entry.Target)
+	entry.UserID = sanitizeString(entry.UserID)
+	entry.Error = sanitizeString(entry.Error)
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return
@@ -157,4 +160,28 @@ func extractIP(addr net.Addr) string {
 		}
 		return host
 	}
+}
+
+func sanitizeString(s string) string {
+	if s == "" {
+		return s
+	}
+	var b []byte
+	for _, r := range s {
+		switch r {
+		case '\n':
+			b = append(b, '\\', 'n')
+		case '\r':
+			b = append(b, '\\', 'r')
+		case '\t':
+			b = append(b, '\\', 't')
+		default:
+			if r < 32 {
+				b = append(b, ' ')
+			} else {
+				b = append(b, []byte(string(r))...)
+			}
+		}
+	}
+	return string(b)
 }

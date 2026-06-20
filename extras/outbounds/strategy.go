@@ -123,9 +123,18 @@ func (s *strategyOutbound) probeOne(outbound PluggableOutbound) time.Duration {
 	ctx, cancel := context.WithTimeout(s.ctx, s.probeTimeout)
 	defer cancel()
 
+	host, portStr, err := net.SplitHostPort(s.probeAddr)
+	if err != nil {
+		return time.Hour
+	}
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		return time.Hour
+	}
+
 	conn, err := outbound.TCP(&AddrEx{
-		Host: "8.8.8.8",
-		Port: 53,
+		Host: host,
+		Port: uint16(port),
 	})
 	if err != nil {
 		return time.Hour
@@ -135,7 +144,6 @@ func (s *strategyOutbound) probeOne(outbound PluggableOutbound) time.Duration {
 	_ = ctx
 	return time.Since(start)
 }
-
 func (s *strategyOutbound) selectOutbound() (PluggableOutbound, string) {
 	switch s.strategy {
 	case StrategyRandom:
