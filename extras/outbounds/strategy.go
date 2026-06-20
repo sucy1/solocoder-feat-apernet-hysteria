@@ -28,10 +28,11 @@ type OutboundStrategy struct {
 }
 
 type strategyOutbound struct {
-	outbounds []OutboundEntry
-	strategy  string
-	probeAddr string
-	probeTimeout time.Duration
+	outbounds      []OutboundEntry
+	strategy       string
+	probeAddr      string
+	probeTimeout   time.Duration
+	probeInterval  time.Duration
 
 	mu        sync.RWMutex
 	latencies map[string]time.Duration
@@ -69,13 +70,14 @@ func NewStrategyOutbound(outbounds []OutboundEntry, cfg OutboundStrategy) (Plugg
 	ctx, cancel := context.WithCancel(context.Background())
 
 	so := &strategyOutbound{
-		outbounds:    outbounds,
-		strategy:     strategy,
-		probeAddr:    probeAddr,
-		probeTimeout: probeTimeout,
-		latencies:    make(map[string]time.Duration),
-		ctx:          ctx,
-		cancel:       cancel,
+		outbounds:     outbounds,
+		strategy:      strategy,
+		probeAddr:     probeAddr,
+		probeTimeout:  probeTimeout,
+		probeInterval: probeInterval,
+		latencies:     make(map[string]time.Duration),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 
 	for _, ob := range outbounds {
@@ -83,15 +85,15 @@ func NewStrategyOutbound(outbounds []OutboundEntry, cfg OutboundStrategy) (Plugg
 	}
 
 	if strategy == StrategyLowestLatency {
-		go so.probeLoop(probeInterval)
+		go so.probeLoop()
 	}
 
 	return so, nil
 }
 
-func (s *strategyOutbound) probeLoop(interval time.Duration) {
+func (s *strategyOutbound) probeLoop() {
 	s.probeAll()
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(s.probeInterval)
 	defer ticker.Stop()
 	for {
 		select {

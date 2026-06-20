@@ -62,6 +62,8 @@ func (l *jsonConnLoggerImpl) writeEntry(entry ConnLogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry.Time = time.Now().Format(time.RFC3339Nano)
+	entry.Type = sanitizeString(entry.Type)
+	entry.SourceIP = sanitizeString(entry.SourceIP)
 	entry.Target = sanitizeString(entry.Target)
 	entry.UserID = sanitizeString(entry.UserID)
 	entry.Error = sanitizeString(entry.Error)

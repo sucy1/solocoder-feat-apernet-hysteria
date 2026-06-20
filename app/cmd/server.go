@@ -342,6 +342,60 @@ type serverConfigMasquerade struct {
 	ForceHTTPS  bool                         `mapstructure:"forceHTTPS"`
 }
 
+func (c *serverConfig) fillPorts(hyConfig *server.Config) error {
+	if len(c.Ports) == 0 {
+		return nil
+	}
+
+	seenAddrs := make(map[string]bool)
+	defaultListen := c.Listen
+	if defaultListen == "" {
+		defaultListen = defaultListenAddr
+	}
+	defaultHost, defaultPort, err := net.SplitHostPort(defaultListen)
+	if err != nil {
+		return configError{Field: "listen", Err: err}
+	}
+
+	for i, portCfg := range c.Ports {
+		if portCfg.Addr == "" {
+			return configError{Field: fmt.Sprintf("ports[%d].addr", i), Err: errors.New("empty listen address")}
+		}
+		switch strings.ToLower(portCfg.Protocol) {
+		case "", "udp", "fake-tcp", "wechat-video":
+		default:
+			return configError{Field: fmt.Sprintf("ports[%d].protocol", i), Err: fmt.Errorf("unsupported protocol: %s", portCfg.Protocol)}
+		}
+
+		host, port, err := net.SplitHostPort(portCfg.Addr)
+		if err != nil {
+			return configError{Field: fmt.Sprintf("ports[%d].addr", i), Err: err}
+		}
+
+		if seenAddrs[portCfg.Addr] {
+			return configError{Field: fmt.Sprintf("ports[%d].addr", i), Err: fmt.Errorf("port %s conflict: duplicate addr %s in config", port, portCfg.Addr)}
+		}
+
+		for seenAddr := range seenAddrs {
+			seenHost, seenPort, err := net.SplitHostPort(seenAddr)
+			if err != nil {
+				continue
+			}
+			if port == seenPort && (host == seenHost || host == "" || seenHost == "" || host == "0.0.0.0" || seenHost == "0.0.0.0" || host == "::" || seenHost == "::") {
+				return configError{Field: fmt.Sprintf("ports[%d].addr", i), Err: fmt.Errorf("port %s conflict: addr %s conflicts with addr %s", port, portCfg.Addr, seenAddr)}
+			}
+		}
+
+		if port == defaultPort && (host == defaultHost || host == "" || defaultHost == "" || host == "0.0.0.0" || defaultHost == "0.0.0.0" || host == "::" || defaultHost == "::") {
+			return configError{Field: fmt.Sprintf("ports[%d].addr", i), Err: fmt.Errorf("port %s conflict: addr %s conflicts with default listen addr %s", port, portCfg.Addr, defaultListen)}
+		}
+
+		seenAddrs[portCfg.Addr] = true
+	}
+
+	return nil
+}
+
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 	if realmAddr, ok, err := parseServerRealmAddr(c.Listen); ok || err != nil {
 		if err != nil {
@@ -1667,6 +1721,7 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 func (c *serverConfig) Config() (*server.Config, error) {
 	hyConfig := &server.Config{}
 	fillers := []func(*server.Config) error{
+		c.fillPorts,
 		c.fillConn,
 		c.fillTLSConfig,
 		c.fillQUICConfig,
