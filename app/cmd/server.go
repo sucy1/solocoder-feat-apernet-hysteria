@@ -35,7 +35,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/apernet/hysteria/app/v2/internal/connlog"
 	"github.com/apernet/hysteria/app/v2/internal/firewall"
+	"github.com/apernet/hysteria/app/v2/internal/multilisten"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/apernet/hysteria/extras/v2/auth"
@@ -65,6 +67,7 @@ func init() {
 
 type serverConfig struct {
 	Listen                string                      `mapstructure:"listen"`
+	Ports                 []serverConfigListenPort    `mapstructure:"ports"`
 	Realm                 serverConfigRealm           `mapstructure:"realm"`
 	Obfs                  serverConfigObfs            `mapstructure:"obfs"`
 	TLS                   *serverConfigTLS            `mapstructure:"tls"`
@@ -78,11 +81,17 @@ type serverConfig struct {
 	UDPIdleTimeout        time.Duration               `mapstructure:"udpIdleTimeout"`
 	Auth                  serverConfigAuth            `mapstructure:"auth"`
 	Resolver              serverConfigResolver        `mapstructure:"resolver"`
+	CustomDNS             serverConfigCustomDNS       `mapstructure:"customDNS"`
 	Sniff                 serverConfigSniff           `mapstructure:"sniff"`
 	ACL                   serverConfigACL             `mapstructure:"acl"`
 	Outbounds             []serverConfigOutboundEntry `mapstructure:"outbounds"`
+	OutboundStrategy      serverConfigOutboundStrategy `mapstructure:"outboundStrategy"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
+	LogConnJSON           serverConfigLogConnJSON     `mapstructure:"logConnJson"`
+
+	trafficHandler http.Handler
+	portManager    multilisten.PortManager
 }
 
 type serverConfigRealm struct {
@@ -264,6 +273,46 @@ type serverConfigOutboundEntry struct {
 type serverConfigTrafficStats struct {
 	Listen string `mapstructure:"listen"`
 	Secret string `mapstructure:"secret"`
+	Period string `mapstructure:"period"`
+	DBPath string `mapstructure:"dbPath"`
+}
+
+type serverConfigListenPort struct {
+	Addr     string `mapstructure:"addr"`
+	Protocol string `mapstructure:"protocol"`
+	ObfsType string `mapstructure:"obfsType"`
+}
+
+type serverConfigCustomDNSRule struct {
+	Suffix   string                  `mapstructure:"suffix"`
+	Upstream serverConfigDNSUpstream `mapstructure:"upstream"`
+}
+
+type serverConfigDNSUpstream struct {
+	Type     string        `mapstructure:"type"`
+	Addr     string        `mapstructure:"addr"`
+	Timeout  time.Duration `mapstructure:"timeout"`
+	SNI      string        `mapstructure:"sni"`
+	Insecure bool          `mapstructure:"insecure"`
+}
+
+type serverConfigCustomDNS struct {
+	Rules     []serverConfigCustomDNSRule `mapstructure:"rules"`
+	Default   serverConfigDNSUpstream     `mapstructure:"default"`
+	CacheTTL  time.Duration               `mapstructure:"cacheTTL"`
+	CacheSize int                         `mapstructure:"cacheSize"`
+}
+
+type serverConfigOutboundStrategy struct {
+	Strategy      string        `mapstructure:"strategy"`
+	ProbeInterval time.Duration `mapstructure:"probeInterval"`
+	ProbeTimeout  time.Duration `mapstructure:"probeTimeout"`
+	ProbeAddr     string        `mapstructure:"probeAddr"`
+}
+
+type serverConfigLogConnJSON struct {
+	Enable bool   `mapstructure:"enable"`
+	Output string `mapstructure:"output"`
 }
 
 type serverConfigMasqueradeFile struct {
@@ -1269,6 +1318,22 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 
 	var uOb outbounds.PluggableOutbound // "unified" outbound
 
+	// Outbound strategy
+	if c.OutboundStrategy.Strategy != "" && len(obs) > 1 {
+		strategyOb, err := outbounds.NewStrategyOutbound(obs, outbounds.OutboundStrategy{
+			Strategy:      c.OutboundStrategy.Strategy,
+			ProbeInterval: c.OutboundStrategy.ProbeInterval,
+			ProbeTimeout:  c.OutboundStrategy.ProbeTimeout,
+			ProbeAddr:     c.OutboundStrategy.ProbeAddr,
+		})
+		if err != nil {
+			return configError{Field: "outboundStrategy", Err: err}
+		}
+		uOb = strategyOb
+	} else if len(obs) == 1 {
+		uOb = obs[0].Outbound
+	}
+
 	// ACL
 	hasACL := false
 	if c.ACL.File != "" && len(c.ACL.Inline) > 0 {
@@ -1295,42 +1360,74 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 			return configError{Field: "acl.inline", Err: err}
 		}
 		uOb = acl
-	} else {
-		// No ACL, use the first outbound
+	} else if uOb == nil {
+		// No ACL, no strategy, use the first outbound
 		uOb = obs[0].Outbound
 	}
 
 	// Resolver
-	switch strings.ToLower(c.Resolver.Type) {
-	case "", "system":
-		if hasACL {
-			// If the user uses ACL, we must put a resolver in front of it,
-			// for IP rules to work on domain requests.
-			uOb = outbounds.NewSystemResolver(uOb)
+	if len(c.CustomDNS.Rules) > 0 || c.CustomDNS.Default.Type != "" {
+		customDNSConfig := outbounds.CustomDNSConfig{
+			CacheTTL:  c.CustomDNS.CacheTTL,
+			CacheSize: c.CustomDNS.CacheSize,
 		}
-		// Otherwise we can just rely on outbound handling on its own.
-	case "tcp":
-		if c.Resolver.TCP.Addr == "" {
-			return configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
+		customDNSConfig.DefaultUpstream = outbounds.DNSUpstreamConfig{
+			Type:     c.CustomDNS.Default.Type,
+			Addr:     c.CustomDNS.Default.Addr,
+			Timeout:  c.CustomDNS.Default.Timeout,
+			SNI:      c.CustomDNS.Default.SNI,
+			Insecure: c.CustomDNS.Default.Insecure,
 		}
-		uOb = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, uOb)
-	case "udp":
-		if c.Resolver.UDP.Addr == "" {
-			return configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
+		customDNSConfig.Rules = make([]outbounds.CustomDNSRule, len(c.CustomDNS.Rules))
+		for i, rule := range c.CustomDNS.Rules {
+			customDNSConfig.Rules[i] = outbounds.CustomDNSRule{
+				Suffix: rule.Suffix,
+				Upstream: outbounds.DNSUpstreamConfig{
+					Type:     rule.Upstream.Type,
+					Addr:     rule.Upstream.Addr,
+					Timeout:  rule.Upstream.Timeout,
+					SNI:      rule.Upstream.SNI,
+					Insecure: rule.Upstream.Insecure,
+				},
+			}
 		}
-		uOb = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, uOb)
-	case "tls", "tcp-tls":
-		if c.Resolver.TLS.Addr == "" {
-			return configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
+		customDNSOb, err := outbounds.NewCustomDNSResolver(customDNSConfig, uOb)
+		if err != nil {
+			return configError{Field: "customDNS", Err: err}
 		}
-		uOb = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, uOb)
-	case "https", "http":
-		if c.Resolver.HTTPS.Addr == "" {
-			return configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
+		uOb = customDNSOb
+	} else {
+		switch strings.ToLower(c.Resolver.Type) {
+		case "", "system":
+			if hasACL {
+				// If the user uses ACL, we must put a resolver in front of it,
+				// for IP rules to work on domain requests.
+				uOb = outbounds.NewSystemResolver(uOb)
+			}
+			// Otherwise we can just rely on outbound handling on its own.
+		case "tcp":
+			if c.Resolver.TCP.Addr == "" {
+				return configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
+			}
+			uOb = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, uOb)
+		case "udp":
+			if c.Resolver.UDP.Addr == "" {
+				return configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
+			}
+			uOb = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, uOb)
+		case "tls", "tcp-tls":
+			if c.Resolver.TLS.Addr == "" {
+				return configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
+			}
+			uOb = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, uOb)
+		case "https", "http":
+			if c.Resolver.HTTPS.Addr == "" {
+				return configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
+			}
+			uOb = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, uOb)
+		default:
+			return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
 		}
-		uOb = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, uOb)
-	default:
-		return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
 	}
 
 	// Speed test
@@ -1425,15 +1522,37 @@ func (c *serverConfig) fillAuthenticator(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
-	hyConfig.EventLogger = &serverLogger{}
+	sl := &serverLogger{}
+	if c.LogConnJSON.Enable {
+		connLogger, err := connlog.NewJSONConnLogger(c.LogConnJSON.Output)
+		if err != nil {
+			return configError{Field: "logConnJson", Err: err}
+		}
+		sl.connLogger = connLogger
+	}
+	hyConfig.EventLogger = sl
 	return nil
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
-		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-		hyConfig.TrafficLogger = tss
-		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+		if c.TrafficStats.Period != "" && c.TrafficStats.DBPath != "" {
+			tss, err := trafficlogger.NewPeriodicTrafficStatsServer(trafficlogger.PeriodicStatsConfig{
+				DBPath:     c.TrafficStats.DBPath,
+				Period:     c.TrafficStats.Period,
+				Secret:     c.TrafficStats.Secret,
+				ListenAddr: c.TrafficStats.Listen,
+			})
+			if err != nil {
+				return configError{Field: "trafficStats", Err: err}
+			}
+			hyConfig.TrafficLogger = tss
+			c.trafficHandler = tss
+		} else {
+			tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+			hyConfig.TrafficLogger = tss
+			c.trafficHandler = tss
+		}
 	}
 	return nil
 }
@@ -1590,6 +1709,23 @@ func runServer(v *viper.Viper) {
 		logger.Fatal("failed to load server config", zap.Error(err))
 	}
 
+	portManager := multilisten.NewPortManager()
+	config.portManager = portManager
+
+	if len(config.Ports) > 0 {
+		for _, portCfg := range config.Ports {
+			listenCfg := multilisten.ListenConfig{
+				Addr:     portCfg.Addr,
+				Protocol: portCfg.Protocol,
+				ObfsType: portCfg.ObfsType,
+			}
+			if err := portManager.AddPort(listenCfg, hyConfig); err != nil {
+				logger.Fatal("failed to add port", zap.String("addr", portCfg.Addr), zap.Error(err))
+			}
+			logger.Info("added listening port", zap.String("addr", portCfg.Addr), zap.String("protocol", portCfg.Protocol))
+		}
+	}
+
 	s, err := server.NewServer(hyConfig)
 	if err != nil {
 		logger.Fatal("failed to initialize server", zap.Error(err))
@@ -1598,6 +1734,16 @@ func runServer(v *viper.Viper) {
 		logger.Info("server up and running", zap.String("listen", config.Listen))
 	} else {
 		logger.Info("server up and running", zap.String("listen", defaultListenAddr))
+	}
+
+	if config.trafficHandler != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/", config.trafficHandler)
+		if config.portManager != nil {
+			portHandler := multilisten.NewHTTPHandler(config.portManager, hyConfig, config.TrafficStats.Secret)
+			mux.Handle("/ports", portHandler)
+		}
+		go runAPIServer(config.TrafficStats.Listen, mux)
 	}
 
 	if !disableUpdateCheck {
@@ -1616,6 +1762,11 @@ func runServer(v *viper.Viper) {
 	select {
 	case <-signalChan:
 		logger.Info("received signal, shutting down gracefully")
+		if config.portManager != nil {
+			if err := config.portManager.Close(); err != nil {
+				logger.Error("failed to close port manager", zap.Error(err))
+			}
+		}
 		if err := s.Close(); err != nil {
 			logger.Error("failed to shut down server cleanly", zap.Error(err))
 		}
@@ -1633,6 +1784,13 @@ func runTrafficStatsServer(listen string, handler http.Handler) {
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
 	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
 		logger.Fatal("failed to serve traffic stats", zap.Error(err))
+	}
+}
+
+func runAPIServer(listen string, handler http.Handler) {
+	logger.Info("API server up and running", zap.String("listen", listen))
+	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
+		logger.Fatal("failed to serve API", zap.Error(err))
 	}
 }
 
@@ -1666,18 +1824,29 @@ func geoDownloadErrFunc(err error) {
 	}
 }
 
-type serverLogger struct{}
+type serverLogger struct {
+	connLogger connlog.JSONConnLogger
+}
 
 func (l *serverLogger) Connect(addr net.Addr, id string, tx uint64) {
 	logger.Info("client connected", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint64("tx", tx))
+	if l.connLogger != nil {
+		l.connLogger.LogConnect("connect", addr, id, "")
+	}
 }
 
 func (l *serverLogger) Disconnect(addr net.Addr, id string, err error) {
 	logger.Info("client disconnected", zap.String("addr", addr.String()), zap.String("id", id), zap.Error(err))
+	if l.connLogger != nil {
+		l.connLogger.LogDisconnect(addr, id, "", 0, 0, 0, err)
+	}
 }
 
 func (l *serverLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 	logger.Debug("TCP request", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr))
+	if l.connLogger != nil {
+		l.connLogger.LogTCPRequest(addr, id, reqAddr)
+	}
 }
 
 func (l *serverLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
@@ -1686,10 +1855,16 @@ func (l *serverLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 	} else {
 		logger.Warn("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
+	if l.connLogger != nil {
+		l.connLogger.LogTCPError(addr, id, reqAddr, err)
+	}
 }
 
 func (l *serverLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string) {
 	logger.Debug("UDP request", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.String("reqAddr", reqAddr))
+	if l.connLogger != nil {
+		l.connLogger.LogUDPRequest(addr, id, sessionID, reqAddr)
+	}
 }
 
 func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err error) {
@@ -1697,6 +1872,9 @@ func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err 
 		logger.Debug("UDP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID))
 	} else {
 		logger.Warn("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
+	}
+	if l.connLogger != nil {
+		l.connLogger.LogUDPError(addr, id, sessionID, err)
 	}
 }
 
