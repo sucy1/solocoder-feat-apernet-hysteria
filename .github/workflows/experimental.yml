@@ -1,0 +1,10 @@
+name: "Build experimental branches"
+
+on:
+  push:
+    branches:
+      - exp/**
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-common.yml

@@ -1,0 +1,10 @@
+name: "Build master branch"
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-common.yml
